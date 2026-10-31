@@ -3,6 +3,7 @@ import libsql
 import requests
 from datetime import datetime
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 
@@ -37,13 +38,20 @@ def init_db():
                 limite REAL,
                 linea_real REAL,
                 cuota_over REAL,
-                timestamp TEXT
+                timestamp TEXT,
+                status TEXT DEFAULT 'PENDING',
+                final_total INTEGER
             )
         """)
+        # Intentar agregar columnas si la tabla ya existía de antes
+        try: con.execute("ALTER TABLE alertas_q3 ADD COLUMN status TEXT DEFAULT 'PENDING'")
+        except: pass
+        try: con.execute("ALTER TABLE alertas_q3 ADD COLUMN final_total INTEGER")
+        except: pass
         con.commit()
         con.close()
     except Exception as e:
-        print(f"[DB Error] {e}")
+        print(f"[DB Error Init] {e}")
 
 def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea, cuota):
     try:
@@ -55,12 +63,62 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
         """, (event_id, matchup, q3_points, proyeccion, limite, linea, cuota, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         con.commit()
         con.close()
-        print(f"💾 Alerta guardada en Turso: {matchup}")
     except Exception as e:
-        print(f"[DB Error] {e}")
+        print(f"[DB Error Guardar] {e}")
 
 # ==========================================
-# TRADUCTOR MAESTRO DE EQUIPOS
+# LÓGICA DE RESULTADOS (GANADAS/PERDIDAS)
+# ==========================================
+def check_results():
+    try:
+        con = get_db()
+        # Buscar alertas pendientes
+        cursor = con.execute("SELECT id, event_id, linea_real FROM alertas_q3 WHERE status = 'PENDING'")
+        pending = cursor.fetchall()
+        con.close()
+
+        if not pending:
+            return
+
+        print(f"🔄 Verificando resultados de {len(pending)} alertas pendientes...")
+        
+        # Obtener partidos actuales de ESPN
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
+        games = r.json().get("events", [])
+        
+        for p in pending:
+            alert_id, event_id, linea = p[0], p[1], p[2]
+            
+            # Buscar el partido en ESPN
+            game = next((g for g in games if g.get("id") == event_id), None)
+            if not game:
+                continue
+
+            state = game.get("status", {}).get("type", {}).get("state", "")
+            if state == "post": # Partido terminado
+                comp = game.get("competitions", [{}])[0]
+                final_total = 0
+                for c in comp.get("competitors", []):
+                    final_total += int(c.get("score", 0) or 0)
+
+                # Calcular resultado
+                if final_total > linea:
+                    status = "WON"
+                elif final_total < linea:
+                    status = "LOST"
+                else:
+                    status = "PUSH"
+
+                con = get_db()
+                con.execute("UPDATE alertas_q3 SET status = ?, final_total = ? WHERE id = ?", (status, final_total, alert_id))
+                con.commit()
+                con.close()
+                print(f"✅ Resultado actualizado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
+    except Exception as e:
+        print(f"[check_results Error] {e}")
+
+# ==========================================
+# TRADUCTOR DE EQUIPOS
 # ==========================================
 def get_team_key(name):
     n = name.lower()
@@ -105,9 +163,7 @@ def enviar_telegram(mensaje):
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "HTML"}
         r = requests.post(url, json=payload, timeout=10)
         return r.status_code == 200
-    except Exception as e:
-        print(f"[Telegram Error] {e}")
-        return False
+    except: return False
 
 # ==========================================
 # API: ESPN
@@ -122,10 +178,8 @@ def get_espn_games():
             if len(cs) < 2: continue
             home = next((c for c in cs if c.get("homeAway") == "home"), cs[0])
             away = next((c for c in cs if c.get("homeAway") == "away"), cs[1])
-            
             q_h = [int(q.get("value", 0)) for q in home.get("linescores", [])]
             q_a = [int(q.get("value", 0)) for q in away.get("linescores", [])]
-            
             st = ev.get("status", {})
             out.append({
                 "id": ev.get("id"),
@@ -140,30 +194,22 @@ def get_espn_games():
                 "total": sum(q_h) + sum(q_a)
             })
         return out
-    except Exception as e:
-        print(f"[ESPN Error] {e}")
-        return []
+    except: return []
 
 # ==========================================
 # API: INFERSPORTS
 # ==========================================
 def get_infer_odds():
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Authorization': f'Bearer {INFER_API_KEY}'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {INFER_API_KEY}'}
         r = requests.get("https://api.infersports.dev/v1/events/live", headers=headers, timeout=15)
         if r.status_code != 200: return {}
-        
         events = [ev for ev in r.json().get("data", []) if ev.get("sport") == "basketball" and ev.get("league", {}).get("name") == "NBA"]
         odds_dict = {}
-        
         for ev in events:
             away_key = get_team_key(ev["away_team"]["name"])
             home_key = get_team_key(ev["home_team"]["name"])
             event_key = f"{away_key}_vs_{home_key}"
-            
             r2 = requests.get(f"https://api.infersports.dev/v1/events/{ev['id']}/odds?format=decimal", headers=headers, timeout=15)
             if r2.status_code == 200:
                 mejor_balance = 999
@@ -181,9 +227,7 @@ def get_infer_odds():
                 if mejor_odd:
                     odds_dict[event_key] = mejor_odd
         return odds_dict
-    except Exception as e:
-        print(f"[Infer Error] {e}")
-        return {}
+    except: return {}
 
 # ==========================================
 # LÓGICA PRINCIPAL
@@ -191,19 +235,15 @@ def get_infer_odds():
 def scan_q3_q4():
     games = get_espn_games()
     if not games: return
-    
     partidos_validos = []
     for g in games:
         if g["id"] in partidos_alertados: continue
-            
         is_q3_end = "End of 3rd" in g["status"] or (g["period"] == 3 and g["clock"] in ["0.0", "0:00"])
         is_q4 = (g["period"] == 4 and g["status"] != "Final")
-        
         if is_q3_end or is_q4:
             partidos_validos.append(g)
             
     if not partidos_validos: return
-        
     print(f"🔍 Escaneando {len(partidos_validos)} partidos en Q3/Q4...")
     infer_odds = get_infer_odds()
     
@@ -211,17 +251,12 @@ def scan_q3_q4():
         t3_home = sum(g["q_h"][:3]) if len(g["q_h"]) >= 3 else sum(g["q_h"])
         t3_away = sum(g["q_a"][:3]) if len(g["q_a"]) >= 3 else sum(g["q_a"])
         t3_total = t3_home + t3_away
-        
         if t3_total == 0: continue
-            
         proyeccion = t3_total * 1.25
         limite_maximo = proyeccion + 6
-        
         event_key = f"{g['away_key']}_vs_{g['home_key']}"
         ln = infer_odds.get(event_key)
-        
         if not ln: continue
-            
         linea_actual = ln["line"]
         
         if linea_actual <= limite_maximo:
@@ -236,12 +271,111 @@ def scan_q3_q4():
                 f"🪙 <b>Cuota Over:</b> @{ln['over']:.2f}\n\n"
                 f"💡 <b>Recomendación:</b> <b>⬆️ OVER {linea_actual:.1f}</b>"
             )
-            
             if enviar_telegram(msg):
                 partidos_alertados.add(g["id"])
-                # Guardar en Turso
                 guardar_alerta_en_db(g["id"], g["matchup"], t3_total, proyeccion, limite_maximo, linea_actual, ln['over'])
                 print(f"✅ Alerta enviada y guardada para {g['matchup']}")
+
+# ==========================================
+# RUTA WEB (Dashboard de Estadísticas)
+# ==========================================
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    try:
+        con = get_db()
+        cursor = con.execute("SELECT id, matchup, q3_points, proyeccion, limite, linea_real, cuota_over, timestamp, status, final_total FROM alertas_q3 ORDER BY id DESC")
+        rows = cursor.fetchall()
+        con.close()
+
+        # Calcular Estadísticas
+        total = len(rows)
+        won = sum(1 for r in rows if r[8] == 'WON')
+        lost = sum(1 for r in rows if r[8] == 'LOST')
+        push = sum(1 for r in rows if r[8] == 'PUSH')
+        pending = sum(1 for r in rows if r[8] == 'PENDING')
+        
+        settled = won + lost
+        win_rate = (won / settled * 100) if settled > 0 else 0
+        
+        # Unidades (apuesta plana de 1 unidad)
+        units = 0.0
+        for r in rows:
+            if r[8] == 'WON': units += (r[6] - 1.0) # Cuota - 1
+            elif r[8] == 'LOST': units -= 1.0
+        
+        units_color = "#22c55e" if units >= 0 else "#ef4444"
+        wr_color = "#22c55e" if win_rate >= 50 else "#ef4444"
+
+        html = f"""
+        <html><head>
+            <title>Q3/Q4 Alerts Dashboard</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: -apple-system, system-ui; background: #0f172a; color: #e2e8f0; padding: 20px; }}
+                .cards {{ display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }}
+                .card {{ background: #1e293b; padding: 20px; border-radius: 10px; flex: 1; min-width: 150px; text-align: center; border-top: 4px solid #3b82f6; }}
+                .card h3 {{ margin: 0 0 10px 0; color: #94a3b8; font-size: 13px; text-transform: uppercase; }}
+                .card .val {{ font-size: 32px; font-weight: bold; }}
+                table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; }}
+                th, td {{ padding: 12px; border-bottom: 1px solid #334155; text-align: center; font-size: 14px; }}
+                th {{ background: #1e293b; color: #94a3b8; text-transform: uppercase; font-size: 12px; }}
+                .won {{ color: #22c55e; font-weight: bold; }}
+                .lost {{ color: #ef4444; font-weight: bold; }}
+                .pending {{ color: #eab308; font-weight: bold; }}
+                .push {{ color: #64748b; font-weight: bold; }}
+            </style>
+        </head><body>
+            <h1>🎯 Q3/Q4 Value Alerts</h1>
+            
+            <div class="cards">
+                <div class="card" style="border-top-color: {wr_color};"><h3>Win Rate</h3><div class="val" style="color:{wr_color};">{win_rate:.1f}%</div></div>
+                <div class="card" style="border-top-color: {units_color};"><h3>Unidades</h3><div class="val" style="color:{units_color};">{units:+.2f} u</div></div>
+                <div class="card"><h3>Ganadas</h3><div class="val" style="color:#22c55e;">{won}</div></div>
+                <div class="card"><h3>Perdidas</h3><div class="val" style="color:#ef4444;">{lost}</div></div>
+                <div class="card" style="border-top-color:#eab308;"><h3>Pendientes</h3><div class="val" style="color:#eab308;">{pending}</div></div>
+            </div>
+
+            <table>
+                <tr>
+                    <th>Partido</th>
+                    <th>Pts Q3</th>
+                    <th>Proyección</th>
+                    <th>Límite (+6)</th>
+                    <th>Línea</th>
+                    <th>Cuota</th>
+                    <th>Total Final</th>
+                    <th>Estado</th>
+                </tr>
+        """
+        
+        if not rows:
+            html += "<tr><td colspan='8'>No hay alertas guardadas aún.</td></tr>"
+        else:
+            for r in rows:
+                status_html = ""
+                if r[8] == 'WON': status_html = '<span class="won">GANADA ✅</span>'
+                elif r[8] == 'LOST': status_html = '<span class="lost">PERDIDA ❌</span>'
+                elif r[8] == 'PUSH': status_html = '<span class="push">EMPATE ⚖️</span>'
+                else: status_html = '<span class="pending">PENDIENTE ⏳</span>'
+
+                html += f"""
+                <tr>
+                    <td style="text-align:left;"><b>{r[1]}</b></td>
+                    <td>{r[2]}</td>
+                    <td>{r[3]:.1f}</td>
+                    <td>{r[4]:.1f}</td>
+                    <td>{r[5]:.1f}</td>
+                    <td>@{r[6]:.2f}</td>
+                    <td>{r[9] if r[9] else '-'}</td>
+                    <td>{status_html}</td>
+                </tr>
+                """
+        
+        html += "</table></body></html>"
+        return html
+
+    except Exception as e:
+        return f"<h1>Error cargando dashboard</h1><p>{e}</p>"
 
 # ==========================================
 # INICIO
@@ -251,8 +385,9 @@ def startup_event():
     init_db()
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(scan_q3_q4, "interval", seconds=60)
+    scheduler.add_job(check_results, "interval", minutes=5) # Revisar resultados cada 5 min
     scheduler.start()
-    print("🚀 Q3/Q4 Scanner iniciado con Turso y Traductor Maestro.")
+    print("🚀 Q3/Q4 Scanner iniciado con Dashboard y Tracker de Resultados.")
 
 @app.get("/health")
 @app.head("/health")
