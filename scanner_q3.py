@@ -43,7 +43,6 @@ def init_db():
                 final_total INTEGER
             )
         """)
-        # Intentar agregar columnas si la tabla ya existía de antes
         try: con.execute("ALTER TABLE alertas_q3 ADD COLUMN status TEXT DEFAULT 'PENDING'")
         except: pass
         try: con.execute("ALTER TABLE alertas_q3 ADD COLUMN final_total INTEGER")
@@ -67,53 +66,40 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
         print(f"[DB Error Guardar] {e}")
 
 # ==========================================
-# LÓGICA DE RESULTADOS (GANADAS/PERDIDAS)
+# LÓGICA DE RESULTADOS
 # ==========================================
 def check_results():
     try:
         con = get_db()
-        # Buscar alertas pendientes
         cursor = con.execute("SELECT id, event_id, linea_real FROM alertas_q3 WHERE status = 'PENDING'")
         pending = cursor.fetchall()
         con.close()
 
-        if not pending:
-            return
+        if not pending: return
 
         print(f"🔄 Verificando resultados de {len(pending)} alertas pendientes...")
-        
-        # Obtener partidos actuales de ESPN
         r = requests.get("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard", timeout=15)
         games = r.json().get("events", [])
         
         for p in pending:
             alert_id, event_id, linea = p[0], p[1], p[2]
-            
-            # Buscar el partido en ESPN
             game = next((g for g in games if g.get("id") == event_id), None)
-            if not game:
-                continue
+            if not game: continue
 
             state = game.get("status", {}).get("type", {}).get("state", "")
-            if state == "post": # Partido terminado
+            if state == "post":
                 comp = game.get("competitions", [{}])[0]
-                final_total = 0
-                for c in comp.get("competitors", []):
-                    final_total += int(c.get("score", 0) or 0)
+                final_total = sum(int(c.get("score", 0) or 0) for c in comp.get("competitors", []))
 
-                # Calcular resultado
-                if final_total > linea:
-                    status = "WON"
-                elif final_total < linea:
-                    status = "LOST"
-                else:
-                    status = "PUSH"
+                if final_total > linea: status = "WON"
+                elif final_total < linea: status = "LOST"
+                else: status = "PUSH"
 
                 con = get_db()
                 con.execute("UPDATE alertas_q3 SET status = ?, final_total = ? WHERE id = ?", (status, final_total, alert_id))
                 con.commit()
                 con.close()
-                print(f"✅ Resultado actualizado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
+                print(f"✅ Resultado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
     except Exception as e:
         print(f"[check_results Error] {e}")
 
@@ -277,7 +263,7 @@ def scan_q3_q4():
                 print(f"✅ Alerta enviada y guardada para {g['matchup']}")
 
 # ==========================================
-# RUTA WEB (Dashboard de Estadísticas)
+# RUTA WEB (Dashboard CLARO)
 # ==========================================
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -287,42 +273,41 @@ def dashboard():
         rows = cursor.fetchall()
         con.close()
 
-        # Calcular Estadísticas
         total = len(rows)
         won = sum(1 for r in rows if r[8] == 'WON')
         lost = sum(1 for r in rows if r[8] == 'LOST')
         push = sum(1 for r in rows if r[8] == 'PUSH')
         pending = sum(1 for r in rows if r[8] == 'PENDING')
-        
         settled = won + lost
         win_rate = (won / settled * 100) if settled > 0 else 0
         
-        # Unidades (apuesta plana de 1 unidad)
         units = 0.0
         for r in rows:
-            if r[8] == 'WON': units += (r[6] - 1.0) # Cuota - 1
+            if r[8] == 'WON': units += (r[6] - 1.0)
             elif r[8] == 'LOST': units -= 1.0
         
-        units_color = "#22c55e" if units >= 0 else "#ef4444"
-        wr_color = "#22c55e" if win_rate >= 50 else "#ef4444"
+        units_color = "#16a34a" if units >= 0 else "#dc2626"
+        wr_color = "#16a34a" if win_rate >= 50 else "#dc2626"
 
+        # DISEÑO CLARO
         html = f"""
         <html><head>
             <title>Q3/Q4 Alerts Dashboard</title>
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
-                body {{ font-family: -apple-system, system-ui; background: #0f172a; color: #e2e8f0; padding: 20px; }}
+                body {{ font-family: -apple-system, system-ui, sans-serif; background-color: #f4f6f9; color: #334155; padding: 20px; }}
+                h1 {{ color: #1e293b; }}
                 .cards {{ display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }}
-                .card {{ background: #1e293b; padding: 20px; border-radius: 10px; flex: 1; min-width: 150px; text-align: center; border-top: 4px solid #3b82f6; }}
-                .card h3 {{ margin: 0 0 10px 0; color: #94a3b8; font-size: 13px; text-transform: uppercase; }}
+                .card {{ background: #ffffff; padding: 20px; border-radius: 10px; flex: 1; min-width: 150px; text-align: center; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border-top: 4px solid #3b82f6; }}
+                .card h3 {{ margin: 0 0 10px 0; color: #64748b; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }}
                 .card .val {{ font-size: 32px; font-weight: bold; }}
-                table {{ width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 8px; overflow: hidden; }}
-                th, td {{ padding: 12px; border-bottom: 1px solid #334155; text-align: center; font-size: 14px; }}
-                th {{ background: #1e293b; color: #94a3b8; text-transform: uppercase; font-size: 12px; }}
-                .won {{ color: #22c55e; font-weight: bold; }}
-                .lost {{ color: #ef4444; font-weight: bold; }}
-                .pending {{ color: #eab308; font-weight: bold; }}
-                .push {{ color: #64748b; font-weight: bold; }}
+                table {{ width: 100%; border-collapse: collapse; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+                th, td {{ padding: 12px; border-bottom: 1px solid #e2e8f0; text-align: center; font-size: 14px; }}
+                th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 12px; font-weight: 600; }}
+                .won {{ color: #16a34a; font-weight: bold; background: #dcfce7; padding: 4px 8px; border-radius: 4px; }}
+                .lost {{ color: #dc2626; font-weight: bold; background: #fee2e2; padding: 4px 8px; border-radius: 4px; }}
+                .pending {{ color: #ca8a04; font-weight: bold; background: #fef08a; padding: 4px 8px; border-radius: 4px; }}
+                .push {{ color: #64748b; font-weight: bold; background: #f1f5f9; padding: 4px 8px; border-radius: 4px; }}
             </style>
         </head><body>
             <h1>🎯 Q3/Q4 Value Alerts</h1>
@@ -330,9 +315,9 @@ def dashboard():
             <div class="cards">
                 <div class="card" style="border-top-color: {wr_color};"><h3>Win Rate</h3><div class="val" style="color:{wr_color};">{win_rate:.1f}%</div></div>
                 <div class="card" style="border-top-color: {units_color};"><h3>Unidades</h3><div class="val" style="color:{units_color};">{units:+.2f} u</div></div>
-                <div class="card"><h3>Ganadas</h3><div class="val" style="color:#22c55e;">{won}</div></div>
-                <div class="card"><h3>Perdidas</h3><div class="val" style="color:#ef4444;">{lost}</div></div>
-                <div class="card" style="border-top-color:#eab308;"><h3>Pendientes</h3><div class="val" style="color:#eab308;">{pending}</div></div>
+                <div class="card" style="border-top-color: #16a34a;"><h3>Ganadas</h3><div class="val" style="color:#16a34a;">{won}</div></div>
+                <div class="card" style="border-top-color: #dc2626;"><h3>Perdidas</h3><div class="val" style="color:#dc2626;">{lost}</div></div>
+                <div class="card" style="border-top-color: #ca8a04;"><h3>Pendientes</h3><div class="val" style="color:#ca8a04;">{pending}</div></div>
             </div>
 
             <table>
@@ -349,7 +334,7 @@ def dashboard():
         """
         
         if not rows:
-            html += "<tr><td colspan='8'>No hay alertas guardadas aún.</td></tr>"
+            html += "<tr><td colspan='8' style='padding: 20px;'>No hay alertas guardadas aún. El bot está escaneando...</td></tr>"
         else:
             for r in rows:
                 status_html = ""
@@ -360,11 +345,11 @@ def dashboard():
 
                 html += f"""
                 <tr>
-                    <td style="text-align:left;"><b>{r[1]}</b></td>
+                    <td style="text-align:left; font-weight: 500;">{r[1]}</td>
                     <td>{r[2]}</td>
                     <td>{r[3]:.1f}</td>
                     <td>{r[4]:.1f}</td>
-                    <td>{r[5]:.1f}</td>
+                    <td style="font-weight: bold; color: #3b82f6;">{r[5]:.1f}</td>
                     <td>@{r[6]:.2f}</td>
                     <td>{r[9] if r[9] else '-'}</td>
                     <td>{status_html}</td>
@@ -385,9 +370,9 @@ def startup_event():
     init_db()
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(scan_q3_q4, "interval", seconds=60)
-    scheduler.add_job(check_results, "interval", minutes=5) # Revisar resultados cada 5 min
+    scheduler.add_job(check_results, "interval", minutes=5)
     scheduler.start()
-    print("🚀 Q3/Q4 Scanner iniciado con Dashboard y Tracker de Resultados.")
+    print("🚀 Q3/Q4 Scanner iniciado (UI Clara)")
 
 @app.get("/health")
 @app.head("/health")
