@@ -66,12 +66,12 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
         print(f"[DB Error Guardar] {e}")
 
 # ==========================================
-# LÓGICA DE RESULTADOS Y TELEGRAM
+# LÓGICA DE RESULTADOS
 # ==========================================
 def check_results():
     try:
         con = get_db()
-        cursor = con.execute("SELECT id, event_id, linea_real, matchup FROM alertas_q3 WHERE status = 'PENDING'")
+        cursor = con.execute("SELECT id, event_id, linea_real FROM alertas_q3 WHERE status = 'PENDING'")
         pending = cursor.fetchall()
         con.close()
 
@@ -82,7 +82,7 @@ def check_results():
         games = r.json().get("events", [])
         
         for p in pending:
-            alert_id, event_id, linea, matchup = p[0], p[1], p[2], p[3]
+            alert_id, event_id, linea = p[0], p[1], p[2]
             game = next((g for g in games if g.get("id") == event_id), None)
             if not game: continue
 
@@ -100,19 +100,6 @@ def check_results():
                 con.commit()
                 con.close()
                 print(f"✅ Resultado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
-                
-                # Enviar resultado a Telegram
-                emoji = "✅" if status == "WON" else "❌" if status == "LOST" else "⚖️"
-                msg_resultado = (
-                    f"🏁 <b>RESULTADO DE ALERTA #{alert_id}</b>\n\n"
-                    f"🏀 <b>{matchup}</b>\n"
-                    f"📌 <b>Línea apostada:</b> {linea:.1f}\n"
-                    f"📊 <b>Total final:</b> {final_total} pts\n\n"
-                    f"{emoji} <b>Resultado:</b> {status}\n"
-                    f"🕑 <i>El bot ha actualizado tu historial.</i>"
-                )
-                enviar_telegram(msg_resultado)
-                
     except Exception as e:
         print(f"[check_results Error] {e}")
 
@@ -153,6 +140,9 @@ def get_team_key(name):
     if "wizards" in n or "was" in n: return "washington"
     return n
 
+# ==========================================
+# TELEGRAM
+# ==========================================
 def enviar_telegram(mensaje):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -162,7 +152,7 @@ def enviar_telegram(mensaje):
     except: return False
 
 # ==========================================
-# API: ESPN Y INFERSPORTS
+# API: ESPN
 # ==========================================
 def get_espn_games():
     try:
@@ -192,6 +182,9 @@ def get_espn_games():
         return out
     except: return []
 
+# ==========================================
+# API: INFERSPORTS
+# ==========================================
 def get_infer_odds():
     try:
         headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {INFER_API_KEY}'}
@@ -296,6 +289,7 @@ def dashboard():
         units_color = "#16a34a" if units >= 0 else "#dc2626"
         wr_color = "#16a34a" if win_rate >= 50 else "#dc2626"
 
+        # DISEÑO CLARO
         html = f"""
         <html><head>
             <title>Q3/Q4 Alerts Dashboard</title>
@@ -378,7 +372,7 @@ def startup_event():
     scheduler.add_job(scan_q3_q4, "interval", seconds=60)
     scheduler.add_job(check_results, "interval", minutes=5)
     scheduler.start()
-    print("🚀 Q3/Q4 Scanner iniciado (UI Clara y Telegram activados)")
+    print("🚀 Q3/Q4 Scanner iniciado (UI Clara)")
 
 @app.get("/health")
 @app.head("/health")
