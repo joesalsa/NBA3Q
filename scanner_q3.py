@@ -18,7 +18,7 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 app = FastAPI()
 partidos_alertados = set()
-partidos_radar = set() # NUEVO: Para no spamear las alertas tempranas
+partidos_radar = set() # NUEVO: Para que el radar avise solo una vez por partido
 
 # ==========================================
 # BASE DE DATOS (TURSO)
@@ -67,11 +67,12 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
         print(f"[DB Error Guardar] {e}")
 
 # ==========================================
-# LÓGICA DE RESULTADOS Y TELEGRAM
+# LÓGICA DE RESULTADOS
 # ==========================================
 def check_results():
     try:
         con = get_db()
+        # MODIFICADO: Agregamos 'matchup' al SELECT para usarlo en el mensaje
         cursor = con.execute("SELECT id, event_id, linea_real, matchup FROM alertas_q3 WHERE status = 'PENDING'")
         pending = cursor.fetchall()
         con.close()
@@ -83,6 +84,7 @@ def check_results():
         games = r.json().get("events", [])
         
         for p in pending:
+            # MODIFICADO: Agregamos matchup al desempaquetado
             alert_id, event_id, linea, matchup = p[0], p[1], p[2], p[3]
             game = next((g for g in games if g.get("id") == event_id), None)
             if not game: continue
@@ -102,7 +104,7 @@ def check_results():
                 con.close()
                 print(f"✅ Resultado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
                 
-                # --- MENSAJE DE RESULTADO A TELEGRAM ---
+                # NUEVO: Enviar mensaje de resultado a Telegram
                 emoji = "✅" if status == "WON" else "❌" if status == "LOST" else "⚖️"
                 msg_resultado = (
                     f"🏁 <b>RESULTADO DE ALERTA #{alert_id}</b>\n\n"
@@ -113,7 +115,7 @@ def check_results():
                     f"🕑 <i>El bot ha actualizado tu historial.</i>"
                 )
                 enviar_telegram(msg_resultado)
-                
+
     except Exception as e:
         print(f"[check_results Error] {e}")
 
@@ -154,6 +156,9 @@ def get_team_key(name):
     if "wizards" in n or "was" in n: return "washington"
     return n
 
+# ==========================================
+# TELEGRAM
+# ==========================================
 def enviar_telegram(mensaje):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -227,7 +232,7 @@ def get_infer_odds():
     except: return {}
 
 # ==========================================
-# LÓGICA PRINCIPAL (CON RADAR)
+# LÓGICA PRINCIPAL
 # ==========================================
 def scan_q3_q4():
     games = get_espn_games()
@@ -249,16 +254,17 @@ def scan_q3_q4():
         t3_away = sum(g["q_a"][:3]) if len(g["q_a"]) >= 3 else sum(g["q_a"])
         t3_total = t3_home + t3_away
         if t3_total == 0: continue
+        
         proyeccion = t3_total * 1.25
         limite_maximo = proyeccion + 6
-        limite_radar = limite_maximo + 5 # NUEVO: 5 puntos por encima del límite
+        limite_radar = limite_maximo + 5 # NUEVO: Límite para el aviso temprano
         
         event_key = f"{g['away_key']}_vs_{g['home_key']}"
         ln = infer_odds.get(event_key)
         if not ln: continue
         linea_actual = ln["line"]
         
-        # --- 1. ALERTA REAL (Línea en rango) ---
+        # 1. ALERTA REAL (Entra en rango)
         if linea_actual <= limite_maximo:
             msg = (
                 f"📡 <b>ALERTA DE VALOR — OVER (Q3/Q4)</b>\n\n"
@@ -276,7 +282,7 @@ def scan_q3_q4():
                 guardar_alerta_en_db(g["id"], g["matchup"], t3_total, proyeccion, limite_maximo, linea_actual, ln['over'])
                 print(f"✅ Alerta enviada y guardada para {g['matchup']}")
                 
-        # --- 2. RADAR DE APROXIMACIÓN (Cerca del rango) ---
+        # 2. RADAR (Está a punto de entrar, a 5 puntos o menos)
         elif limite_maximo < linea_actual <= limite_radar:
             if g["id"] not in partidos_radar:
                 distancia = linea_actual - limite_maximo
@@ -294,3 +300,123 @@ def scan_q3_q4():
                 if enviar_telegram(msg_radar):
                     partidos_radar.add(g["id"])
                     print(f"🟡 Radar enviado para {g['matchup']} (Línea a {distancia:.1f} pts)")
+
+# ==========================================
+# RUTA WEB (Dashboard CLARO)
+# ==========================================
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    try:
+        con = get_db()
+        cursor = con.execute("SELECT id, matchup, q3_points, proyeccion, limite, linea_real, cuota_over, timestamp, status, final_total FROM alertas_q3 ORDER BY id DESC")
+        rows = cursor.fetchall()
+        con.close()
+
+        total = len(rows)
+        won = sum(1 for r in rows if r[8] == 'WON')
+        lost = sum(1 for r in rows if r[8] == 'LOST')
+        push = sum(1 for r in rows if r[8] == 'PUSH')
+        pending = sum(1 for r in rows if r[8] == 'PENDING')
+        settled = won + lost
+        win_rate = (won / settled * 100) if settled > 0 else 0
+        
+        units = 0.0
+        for r in rows:
+            if r[8] == 'WON': units += (r[6] - 1.0)
+            elif r[8] == 'LOST': units -= 1.0
+        
+        units_color = "#16a34a" if units >= 0 else "#dc2626"
+        wr_color = "#16a34a" if win_rate >= 50 else "#dc2626"
+
+        html = f"""
+        <html><head>
+            <title>Q3/Q4 Alerts Dashboard</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{ font-family: -apple-system, system-ui, sans-serif; background-color: #f4f6f9; color: #334155; padding: 20px; }}
+                h1 {{ color: #1e293b; }}
+                .cards {{ display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }}
+                .card {{ background: #ffffff; padding: 20px; border-radius: 10px; flex: 1; min-width: 150px; text-align: center; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border-top: 4px solid #3b82f6; }}
+                .card h3 {{ margin: 0 0 10px 0; color: #64748b; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }}
+                .card .val {{ font-size: 32px; font-weight: bold; }}
+                table {{ width: 100%; border-collapse: collapse; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
+                th, td {{ padding: 12px; border-bottom: 1px solid #e2e8f0; text-align: center; font-size: 14px; }}
+                th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 12px; font-weight: 600; }}
+                .won {{ color: #16a34a; font-weight: bold; background: #dcfce7; padding: 4px 8px; border-radius: 4px; }}
+                .lost {{ color: #dc2626; font-weight: bold; background: #fee2e2; padding: 4px 8px; border-radius: 4px; }}
+                .pending {{ color: #ca8a04; font-weight: bold; background: #fef08a; padding: 4px 8px; border-radius: 4px; }}
+                .push {{ color: #64748b; font-weight: bold; background: #f1f5f9; padding: 4px 8px; border-radius: 4px; }}
+            </style>
+        </head><body>
+            <h1>🎯 Q3/Q4 Value Alerts</h1>
+            
+            <div class="cards">
+                <div class="card" style="border-top-color: {wr_color};"><h3>Win Rate</h3><div class="val" style="color:{wr_color};">{win_rate:.1f}%</div></div>
+                <div class="card" style="border-top-color: {units_color};"><h3>Unidades</h3><div class="val" style="color:{units_color};">{units:+.2f} u</div></div>
+                <div class="card" style="border-top-color: #16a34a;"><h3>Ganadas</h3><div class="val" style="color:#16a34a;">{won}</div></div>
+                <div class="card" style="border-top-color: #dc2626;"><h3>Perdidas</h3><div class="val" style="color:#dc2626;">{lost}</div></div>
+                <div class="card" style="border-top-color: #ca8a04;"><h3>Pendientes</h3><div class="val" style="color:#ca8a04;">{pending}</div></div>
+            </div>
+
+            <table>
+                <tr>
+                    <th>Partido</th>
+                    <th>Pts Q3</th>
+                    <th>Proyección</th>
+                    <th>Límite (+6)</th>
+                    <th>Línea</th>
+                    <th>Cuota</th>
+                    <th>Total Final</th>
+                    <th>Estado</th>
+                </tr>
+        """
+        
+        if not rows:
+            html += "<tr><td colspan='8' style='padding: 20px;'>No hay alertas guardadas aún. El bot está escaneando...</td></tr>"
+        else:
+            for r in rows:
+                status_html = ""
+                if r[8] == 'WON': status_html = '<span class="won">GANADA ✅</span>'
+                elif r[8] == 'LOST': status_html = '<span class="lost">PERDIDA ❌</span>'
+                elif r[8] == 'PUSH': status_html = '<span class="push">EMPATE ⚖️</span>'
+                else: status_html = '<span class="pending">PENDIENTE ⏳</span>'
+
+                html += f"""
+                <tr>
+                    <td style="text-align:left; font-weight: 500;">{r[1]}</td>
+                    <td>{r[2]}</td>
+                    <td>{r[3]:.1f}</td>
+                    <td>{r[4]:.1f}</td>
+                    <td style="font-weight: bold; color: #3b82f6;">{r[5]:.1f}</td>
+                    <td>@{r[6]:.2f}</td>
+                    <td>{r[9] if r[9] else '-'}</td>
+                    <td>{status_html}</td>
+                </tr>
+                """
+        
+        html += "</table></body></html>"
+        return html
+
+    except Exception as e:
+        return f"<h1>Error cargando dashboard</h1><p>{e}</p>"
+
+# ==========================================
+# INICIO
+# ==========================================
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(scan_q3_q4, "interval", seconds=60)
+    scheduler.add_job(check_results, "interval", minutes=5)
+    scheduler.start()
+    print("🚀 Q3/Q4 Scanner iniciado (Radar y Resultados activados)")
+
+@app.get("/health")
+@app.head("/health")
+def health_check():
+    return {"status": "ok"}
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("scanner_q3:app", host="0.0.0.0", port=port)
