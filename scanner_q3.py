@@ -1,9 +1,11 @@
 import os
+import json
 import libsql
 import requests
+import time
 from datetime import datetime
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
 
@@ -18,7 +20,9 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 app = FastAPI()
 partidos_alertados = set()
-partidos_radar = set() # NUEVO: Para que el radar avise solo una vez por partido
+partidos_radar = set()
+pregame_lines_memory = {} # <--- NUEVO: Guarda las líneas pregame para comparar en vivo
+last_live_data = {}       # <--- NUEVO: Caché para no saturar las APIs en el dashboard
 
 # ==========================================
 # BASE DE DATOS (TURSO)
@@ -72,7 +76,6 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
 def check_results():
     try:
         con = get_db()
-        # MODIFICADO: Agregamos 'matchup' al SELECT para usarlo en el mensaje
         cursor = con.execute("SELECT id, event_id, linea_real, matchup FROM alertas_q3 WHERE status = 'PENDING'")
         pending = cursor.fetchall()
         con.close()
@@ -84,7 +87,6 @@ def check_results():
         games = r.json().get("events", [])
         
         for p in pending:
-            # MODIFICADO: Agregamos matchup al desempaquetado
             alert_id, event_id, linea, matchup = p[0], p[1], p[2], p[3]
             game = next((g for g in games if g.get("id") == event_id), None)
             if not game: continue
@@ -104,7 +106,6 @@ def check_results():
                 con.close()
                 print(f"✅ Resultado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
                 
-                # NUEVO: Enviar mensaje de resultado a Telegram
                 emoji = "✅" if status == "WON" else "❌" if status == "LOST" else "⚖️"
                 msg_resultado = (
                     f"🏁 <b>RESULTADO DE ALERTA #{alert_id}</b>\n\n"
@@ -120,7 +121,7 @@ def check_results():
         print(f"[check_results Error] {e}")
 
 # ==========================================
-# TRADUCTOR DE EQUIPOS
+# TRADUCTOR Y TELEGRAM
 # ==========================================
 def get_team_key(name):
     n = name.lower()
@@ -156,9 +157,6 @@ def get_team_key(name):
     if "wizards" in n or "was" in n: return "washington"
     return n
 
-# ==========================================
-# TELEGRAM
-# ==========================================
 def enviar_telegram(mensaje):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -168,7 +166,7 @@ def enviar_telegram(mensaje):
     except: return False
 
 # ==========================================
-# API: ESPN
+# API: ESPN E INFERSPORTS
 # ==========================================
 def get_espn_games():
     try:
@@ -189,6 +187,7 @@ def get_espn_games():
                 "away_key": get_team_key(away.get('team', {}).get('displayName', '')),
                 "home_key": get_team_key(home.get('team', {}).get('displayName', '')),
                 "status": st.get("type", {}).get("description", ""),
+                "state": st.get("type", {}).get("state", ""),
                 "period": int(st.get("period", 0) or 0),
                 "clock": st.get("displayClock", "") or "",
                 "q_h": q_h,
@@ -198,9 +197,6 @@ def get_espn_games():
         return out
     except: return []
 
-# ==========================================
-# API: INFERSPORTS
-# ==========================================
 def get_infer_odds():
     try:
         headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {INFER_API_KEY}'}
@@ -232,13 +228,18 @@ def get_infer_odds():
     except: return {}
 
 # ==========================================
-# LÓGICA PRINCIPAL
+# LÓGICA PRINCIPAL (AQUÍ NO TOCAMOS NADA DE TELEGRAM)
 # ==========================================
 def scan_q3_q4():
     games = get_espn_games()
     if not games: return
+    
     partidos_validos = []
     for g in games:
+        # NUEVO: Si el partido no ha empezado, guardamos la línea viva como referencia de Pregame
+        if g["state"] == "pre":
+            continue 
+            
         if g["id"] in partidos_alertados: continue
         is_q3_end = "End of 3rd" in g["status"] or (g["period"] == 3 and g["clock"] in ["0.0", "0:00"])
         is_q4 = (g["period"] == 4 and g["status"] != "Final")
@@ -257,14 +258,14 @@ def scan_q3_q4():
         
         proyeccion = t3_total * 1.25
         limite_maximo = proyeccion + 6
-        limite_radar = limite_maximo + 5 # NUEVO: Límite para el aviso temprano
+        limite_radar = limite_maximo + 5
         
         event_key = f"{g['away_key']}_vs_{g['home_key']}"
         ln = infer_odds.get(event_key)
         if not ln: continue
         linea_actual = ln["line"]
         
-        # 1. ALERTA REAL (Entra en rango)
+        # 1. ALERTA REAL
         if linea_actual <= limite_maximo:
             msg = (
                 f"📡 <b>ALERTA DE VALOR — OVER (Q3/Q4)</b>\n\n"
@@ -282,7 +283,7 @@ def scan_q3_q4():
                 guardar_alerta_en_db(g["id"], g["matchup"], t3_total, proyeccion, limite_maximo, linea_actual, ln['over'])
                 print(f"✅ Alerta enviada y guardada para {g['matchup']}")
                 
-        # 2. RADAR (Está a punto de entrar, a 5 puntos o menos)
+        # 2. RADAR
         elif limite_maximo < linea_actual <= limite_radar:
             if g["id"] not in partidos_radar:
                 distancia = linea_actual - limite_maximo
@@ -302,7 +303,65 @@ def scan_q3_q4():
                     print(f"🟡 Radar enviado para {g['matchup']} (Línea a {distancia:.1f} pts)")
 
 # ==========================================
-# RUTA WEB (Dashboard CLARO)
+# NUEVO ENDPOINT API PARA EL DASHBOARD EN VIVO
+# ==========================================
+@app.get("/api/live", response_class=JSONResponse)
+def api_live():
+    games = get_espn_games()
+    if not games: return {"juegos": []}
+    
+    infer_odds = get_infer_odds()
+    juegos_live = []
+    
+    for g in games:
+        if g["state"] != "in": continue # Solo los que están jugando
+        
+        event_key = f"{g['away_key']}_vs_{g['home_key']}"
+        ln = infer_odds.get(event_key)
+        
+        # Calcular proyección dinámica (Ritmo en vivo)
+        mins_transcurridos = ((g["period"] - 1) * 12) + (12 - (int(g["clock"].split(":")[0]) if ":" in g["clock"] else 0))
+        ritmo = g["total"] / max(1, mins_transcurridos)
+        proy_viva = ritmo * 48
+        
+        limite = proy_viva + 6
+        linea_viva = ln["line"] if ln else 0
+        
+        # Lógica de colores
+        if not ln:
+            color = "gray"
+            estado = "Sin cuota en vivo"
+        elif linea_viva <= limite:
+            color = "green"
+            estado = "¡VALOR DETECTADO!"
+        elif linea_viva <= limite + 5:
+            color = "yellow"
+            estado = "En el Radar (Cerca)"
+        else:
+            color = "red"
+            estado = "Lejos del valor"
+            
+        # Obtener pregame (si lo guardamos antes)
+        pregame = pregame_lines_memory.get(g["id"], 0.0)
+
+        juegos_live.append({
+            "id": g["id"],
+            "matchup": g["matchup"],
+            "status": f"Q{g['period']} - {g['clock']}",
+            "total": g["total"],
+            "pregame": pregame,
+            "linea_viva": linea_viva,
+            "proyeccion_viva": round(proy_viva, 1),
+            "limite": round(limite, 1),
+            "cuota": ln["over"] if ln else 0.0,
+            "color": color,
+            "estado": estado
+        })
+        
+    return {"juegos": juegos_live}
+
+# ==========================================
+# RUTA WEB (DASHBOARD MEJORADO)
 # ==========================================
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
@@ -334,11 +393,30 @@ def dashboard():
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <style>
                 body {{ font-family: -apple-system, system-ui, sans-serif; background-color: #f4f6f9; color: #334155; padding: 20px; }}
-                h1 {{ color: #1e293b; }}
+                h1, h2 {{ color: #1e293b; }}
                 .cards {{ display: flex; gap: 15px; margin-bottom: 25px; flex-wrap: wrap; }}
                 .card {{ background: #ffffff; padding: 20px; border-radius: 10px; flex: 1; min-width: 150px; text-align: center; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); border-top: 4px solid #3b82f6; }}
                 .card h3 {{ margin: 0 0 10px 0; color: #64748b; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }}
                 .card .val {{ font-size: 32px; font-weight: bold; }}
+                
+                /* ESTILOS DEL PANEL EN VIVO */
+                .live-panel {{ display: flex; gap: 15px; overflow-x: auto; padding-bottom: 15px; margin-bottom: 25px; }}
+                .live-card {{ background: #ffffff; min-width: 280px; padding: 15px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-left: 6px solid #cbd5e1; }}
+                .live-card.green {{ border-left-color: #10b981; background: #f0fdf4; }}
+                .live-card.yellow {{ border-left-color: #eab308; background: #fefce8; }}
+                .live-card.red {{ border-left-color: #ef4444; }}
+                .live-card.gray {{ border-left-color: #64748b; }}
+                .live-title {{ font-weight: bold; font-size: 15px; margin-bottom: 5px; color: #1e293b; }}
+                .live-status {{ font-size: 12px; color: #64748b; margin-bottom: 12px; font-weight: 600; }}
+                .live-data {{ display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }}
+                .live-label {{ color: #64748b; }}
+                .live-value {{ font-weight: bold; }}
+                .live-badge {{ display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-top: 8px; width: 100%; text-align: center; }}
+                .badge-green {{ background: #10b981; color: white; }}
+                .badge-yellow {{ background: #eab308; color: white; }}
+                .badge-red {{ background: #ef4444; color: white; }}
+                .badge-gray {{ background: #e2e8f0; color: #475569; }}
+                
                 table {{ width: 100%; border-collapse: collapse; background: #ffffff; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); }}
                 th, td {{ padding: 12px; border-bottom: 1px solid #e2e8f0; text-align: center; font-size: 14px; }}
                 th {{ background-color: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 12px; font-weight: 600; }}
@@ -347,6 +425,48 @@ def dashboard():
                 .pending {{ color: #ca8a04; font-weight: bold; background: #fef08a; padding: 4px 8px; border-radius: 4px; }}
                 .push {{ color: #64748b; font-weight: bold; background: #f1f5f9; padding: 4px 8px; border-radius: 4px; }}
             </style>
+            <script>
+                // JavaScript para actualizar el panel en vivo cada 10 segundos sin recargar
+                async function fetchLiveGames() {{
+                    try {{
+                        const response = await fetch('/api/live');
+                        const data = await response.json();
+                        const container = document.getElementById('live-container');
+                        
+                        if (data.juegos.length === 0) {{
+                            container.innerHTML = '<p style="color:#64748b;">No hay partidos en vivo ahora mismo.</p>';
+                            return;
+                        }}
+                        
+                        let html = '';
+                        data.juegos.forEach(j => {{
+                            let badgeClass = 'badge-' + j.color;
+                            let cardClass = 'live-card ' + j.color;
+                            html += `
+                            <div class="${{cardClass}}">
+                                <div class="live-title">${{j.matchup}}</div>
+                                <div class="live-status">⏱️ ${{j.status}} | Total: ${{j.total}}</div>
+                                <div class="live-data"><span class="live-label">Línea Viva:</span> <span class="live-value">${{j.linea_viva}}</span></div>
+                                <div class="live-data"><span class="live-label">Proy. Dinámica:</span> <span class="live-value">${{j.proyeccion_viva}}</span></div>
+                                <div class="live-data"><span class="live-label">Límite (+6):</span> <span class="live-value">${{j.limite}}</span></div>
+                                <div class="live-data"><span class="live-label">Pregame:</span> <span class="live-value">${{j.pregame > 0 ? j.pregame : 'N/A'}}</span></div>
+                                <div class="live-data"><span class="live-label">Cuota Over:</span> <span class="live-value">@${{j.cuota}}</span></div>
+                                <div class="live-badge ${{badgeClass}}">${{j.estado}}</div>
+                            </div>
+                            `;
+                        }});
+                        container.innerHTML = html;
+                    }} catch (error) {{
+                        console.error('Error fetching live games:', error);
+                    }}
+                }}
+                
+                // Ejecutar al cargar la página y luego cada 10 segundos
+                document.addEventListener('DOMContentLoaded', () => {{
+                    fetchLiveGames();
+                    setInterval(fetchLiveGames, 10000);
+                }});
+            </script>
         </head><body>
             <h1>🎯 Q3/Q4 Value Alerts</h1>
             
@@ -358,6 +478,12 @@ def dashboard():
                 <div class="card" style="border-top-color: #ca8a04;"><h3>Pendientes</h3><div class="val" style="color:#ca8a04;">{pending}</div></div>
             </div>
 
+            <h2>🔴 Partidos en Vivo (Actualización Automática)</h2>
+            <div id="live-container" class="live-panel">
+                <p style="color: #64748b;">Cargando partidos en vivo...</p>
+            </div>
+
+            <h2>📊 Historial de Alertas</h2>
             <table>
                 <tr>
                     <th>Partido</th>
@@ -409,6 +535,8 @@ def startup_event():
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(scan_q3_q4, "interval", seconds=60)
     scheduler.add_job(check_results, "interval", minutes=5)
+    # NUEVO: Guardar las líneas pregame en segundo plano para compararlas después
+    scheduler.add_job(save_pregame_lines, "interval", minutes=5) 
     scheduler.start()
     print("🚀 Q3/Q4 Scanner iniciado (Radar y Resultados activados)")
 
