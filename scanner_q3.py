@@ -21,8 +21,7 @@ TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 app = FastAPI()
 partidos_alertados = set()
 partidos_radar = set()
-pregame_lines_memory = {} # <--- NUEVO: Guarda las líneas pregame para comparar en vivo
-last_live_data = {}       # <--- NUEVO: Caché para no saturar las APIs en el dashboard
+pregame_lines_memory = {} # Guarda las líneas pregame para comparar en vivo
 
 # ==========================================
 # BASE DE DATOS (TURSO)
@@ -228,7 +227,38 @@ def get_infer_odds():
     except: return {}
 
 # ==========================================
-# LÓGICA PRINCIPAL (AQUÍ NO TOCAMOS NADA DE TELEGRAM)
+# NUEVA FUNCIÓN: GUARDAR PREGAME LINES
+# ==========================================
+def save_pregame_lines():
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {INFER_API_KEY}'}
+        # Buscamos partidos programados en InferSports
+        r = requests.get("https://api.infersports.dev/v1/events", headers=headers, params={"sport": "basketball", "league": "NBA", "status": "scheduled"}, timeout=15)
+        if r.status_code != 200: return
+        
+        scheduled_events = r.json().get("data", [])
+        games = get_espn_games()
+        pre_games = [g for g in games if g["state"] == "pre"]
+        
+        for g in pre_games:
+            if g["id"] in pregame_lines_memory: continue # Ya lo tenemos
+            
+            for ev in scheduled_events:
+                away_key = get_team_key(ev["away_team"]["name"])
+                home_key = get_team_key(ev["home_team"]["name"])
+                if away_key == g["away_key"] and home_key == g["home_key"]:
+                    r2 = requests.get(f"https://api.infersports.dev/v1/events/{ev['id']}/odds?format=decimal", headers=headers, timeout=15)
+                    if r2.status_code == 200:
+                        for odd in r2.json().get("odds", []):
+                            if odd.get("market_type") == "totals" and odd.get("period") == "full_time" and odd.get("status") == "open":
+                                pregame_lines_memory[g["id"]] = float(odd.get("line"))
+                                print(f"📌 Pregame guardado: {g['matchup']} -> {odd.get('line')}")
+                                break
+    except Exception as e:
+        print(f"[save_pregame_lines Error] {e}")
+
+# ==========================================
+# LÓGICA PRINCIPAL
 # ==========================================
 def scan_q3_q4():
     games = get_espn_games()
@@ -236,10 +266,6 @@ def scan_q3_q4():
     
     partidos_validos = []
     for g in games:
-        # NUEVO: Si el partido no ha empezado, guardamos la línea viva como referencia de Pregame
-        if g["state"] == "pre":
-            continue 
-            
         if g["id"] in partidos_alertados: continue
         is_q3_end = "End of 3rd" in g["status"] or (g["period"] == 3 and g["clock"] in ["0.0", "0:00"])
         is_q4 = (g["period"] == 4 and g["status"] != "Final")
@@ -303,7 +329,7 @@ def scan_q3_q4():
                     print(f"🟡 Radar enviado para {g['matchup']} (Línea a {distancia:.1f} pts)")
 
 # ==========================================
-# NUEVO ENDPOINT API PARA EL DASHBOARD EN VIVO
+# ENDPOINT API PARA EL DASHBOARD EN VIVO
 # ==========================================
 @app.get("/api/live", response_class=JSONResponse)
 def api_live():
@@ -341,7 +367,6 @@ def api_live():
             color = "red"
             estado = "Lejos del valor"
             
-        # Obtener pregame (si lo guardamos antes)
         pregame = pregame_lines_memory.get(g["id"], 0.0)
 
         juegos_live.append({
@@ -426,7 +451,6 @@ def dashboard():
                 .push {{ color: #64748b; font-weight: bold; background: #f1f5f9; padding: 4px 8px; border-radius: 4px; }}
             </style>
             <script>
-                // JavaScript para actualizar el panel en vivo cada 10 segundos sin recargar
                 async function fetchLiveGames() {{
                     try {{
                         const response = await fetch('/api/live');
@@ -461,7 +485,6 @@ def dashboard():
                     }}
                 }}
                 
-                // Ejecutar al cargar la página y luego cada 10 segundos
                 document.addEventListener('DOMContentLoaded', () => {{
                     fetchLiveGames();
                     setInterval(fetchLiveGames, 10000);
@@ -535,7 +558,6 @@ def startup_event():
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(scan_q3_q4, "interval", seconds=60)
     scheduler.add_job(check_results, "interval", minutes=5)
-    # NUEVO: Guardar las líneas pregame en segundo plano para compararlas después
     scheduler.add_job(save_pregame_lines, "interval", minutes=5) 
     scheduler.start()
     print("🚀 Q3/Q4 Scanner iniciado (Radar y Resultados activados)")
