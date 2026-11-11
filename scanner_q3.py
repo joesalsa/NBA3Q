@@ -180,17 +180,25 @@ def get_espn_games():
             q_h = [int(q.get("value", 0)) for q in home.get("linescores", [])]
             q_a = [int(q.get("value", 0)) for q in away.get("linescores", [])]
             st = ev.get("status", {})
+            
+            away_name = away.get('team', {}).get('displayName', '')
+            home_name = home.get('team', {}).get('displayName', '')
+            
             out.append({
                 "id": ev.get("id"),
-                "matchup": f"{away.get('team', {}).get('displayName')} vs {home.get('team', {}).get('displayName')}",
-                "away_key": get_team_key(away.get('team', {}).get('displayName', '')),
-                "home_key": get_team_key(home.get('team', {}).get('displayName', '')),
+                "matchup": f"{away_name} vs {home_name}",
+                "away_name": away_name,
+                "home_name": home_name,
+                "away_key": get_team_key(away_name),
+                "home_key": get_team_key(home_name),
                 "status": st.get("type", {}).get("description", ""),
                 "state": st.get("type", {}).get("state", ""),
                 "period": int(st.get("period", 0) or 0),
                 "clock": st.get("displayClock", "") or "",
                 "q_h": q_h,
                 "q_a": q_a,
+                "away_score": sum(q_a),
+                "home_score": sum(q_h),
                 "total": sum(q_h) + sum(q_a)
             })
         return out
@@ -232,7 +240,6 @@ def get_infer_odds():
 def save_pregame_lines():
     try:
         headers = {'User-Agent': 'Mozilla/5.0', 'Authorization': f'Bearer {INFER_API_KEY}'}
-        # Buscamos partidos programados en InferSports
         r = requests.get("https://api.infersports.dev/v1/events", headers=headers, params={"sport": "basketball", "league": "NBA", "status": "scheduled"}, timeout=15)
         if r.status_code != 200: return
         
@@ -241,7 +248,7 @@ def save_pregame_lines():
         pre_games = [g for g in games if g["state"] == "pre"]
         
         for g in pre_games:
-            if g["id"] in pregame_lines_memory: continue # Ya lo tenemos
+            if g["id"] in pregame_lines_memory: continue
             
             for ev in scheduled_events:
                 away_key = get_team_key(ev["away_team"]["name"])
@@ -291,7 +298,6 @@ def scan_q3_q4():
         if not ln: continue
         linea_actual = ln["line"]
         
-        # 1. ALERTA REAL
         if linea_actual <= limite_maximo:
             msg = (
                 f"📡 <b>ALERTA DE VALOR — OVER (Q3/Q4)</b>\n\n"
@@ -309,7 +315,6 @@ def scan_q3_q4():
                 guardar_alerta_en_db(g["id"], g["matchup"], t3_total, proyeccion, limite_maximo, linea_actual, ln['over'])
                 print(f"✅ Alerta enviada y guardada para {g['matchup']}")
                 
-        # 2. RADAR
         elif limite_maximo < linea_actual <= limite_radar:
             if g["id"] not in partidos_radar:
                 distancia = linea_actual - limite_maximo
@@ -329,7 +334,7 @@ def scan_q3_q4():
                     print(f"🟡 Radar enviado para {g['matchup']} (Línea a {distancia:.1f} pts)")
 
 # ==========================================
-# ENDPOINT API PARA EL DASHBOARD EN VIVO
+# ENDPOINT API PARA EL DASHBOARD EN VIVO (CORREGIDO)
 # ==========================================
 @app.get("/api/live", response_class=JSONResponse)
 def api_live():
@@ -340,12 +345,11 @@ def api_live():
     juegos_live = []
     
     for g in games:
-        if g["state"] != "in": continue # Solo los que están jugando
+        if g["state"] != "in": continue
         
         event_key = f"{g['away_key']}_vs_{g['home_key']}"
         ln = infer_odds.get(event_key)
         
-        # Calcular proyección dinámica (Ritmo en vivo)
         mins_transcurridos = ((g["period"] - 1) * 12) + (12 - (int(g["clock"].split(":")[0]) if ":" in g["clock"] else 0))
         ritmo = g["total"] / max(1, mins_transcurridos)
         proy_viva = ritmo * 48
@@ -353,27 +357,33 @@ def api_live():
         limite = proy_viva + 6
         linea_viva = ln["line"] if ln else 0
         
-        # Lógica de colores
-        if not ln:
+        # LÓGICA CORREGIDA: Solo mostrar "VALOR" si estamos en Q3 o Q4
+        if g["period"] < 3:
             color = "gray"
-            estado = "Sin cuota en vivo"
-        elif linea_viva <= limite:
-            color = "green"
-            estado = "¡VALOR DETECTADO!"
-        elif linea_viva <= limite + 5:
-            color = "yellow"
-            estado = "En el Radar (Cerca)"
+            estado = f"Esperando Q3 (Q{g['period']})"
         else:
-            color = "red"
-            estado = "Lejos del valor"
-            
+            if not ln:
+                color = "gray"
+                estado = "Sin cuota en vivo"
+            elif linea_viva <= limite:
+                color = "green"
+                estado = "¡VALOR DETECTADO!"
+            elif linea_viva <= limite + 5:
+                color = "yellow"
+                estado = "En el Radar (Cerca)"
+            else:
+                color = "red"
+                estado = "Lejos del valor"
+                
         pregame = pregame_lines_memory.get(g["id"], 0.0)
 
         juegos_live.append({
             "id": g["id"],
-            "matchup": g["matchup"],
+            "away_name": g["away_name"],
+            "home_name": g["home_name"],
+            "away_score": g["away_score"],
+            "home_score": g["home_score"],
             "status": f"Q{g['period']} - {g['clock']}",
-            "total": g["total"],
             "pregame": pregame,
             "linea_viva": linea_viva,
             "proyeccion_viva": round(proy_viva, 1),
@@ -424,14 +434,16 @@ def dashboard():
                 .card h3 {{ margin: 0 0 10px 0; color: #64748b; font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }}
                 .card .val {{ font-size: 32px; font-weight: bold; }}
                 
-                /* ESTILOS DEL PANEL EN VIVO */
                 .live-panel {{ display: flex; gap: 15px; overflow-x: auto; padding-bottom: 15px; margin-bottom: 25px; }}
                 .live-card {{ background: #ffffff; min-width: 280px; padding: 15px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border-left: 6px solid #cbd5e1; }}
                 .live-card.green {{ border-left-color: #10b981; background: #f0fdf4; }}
                 .live-card.yellow {{ border-left-color: #eab308; background: #fefce8; }}
                 .live-card.red {{ border-left-color: #ef4444; }}
                 .live-card.gray {{ border-left-color: #64748b; }}
-                .live-title {{ font-weight: bold; font-size: 15px; margin-bottom: 5px; color: #1e293b; }}
+                
+                .live-title {{ font-weight: bold; font-size: 14px; margin-bottom: 5px; color: #1e293b; display: flex; justify-content: space-between; align-items: center; }}
+                .live-score {{ font-size: 16px; font-weight: 800; color: #0f172a; }}
+                
                 .live-status {{ font-size: 12px; color: #64748b; margin-bottom: 12px; font-weight: 600; }}
                 .live-data {{ display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 4px; }}
                 .live-label {{ color: #64748b; }}
@@ -468,8 +480,12 @@ def dashboard():
                             let cardClass = 'live-card ' + j.color;
                             html += `
                             <div class="${{cardClass}}">
-                                <div class="live-title">${{j.matchup}}</div>
-                                <div class="live-status">⏱️ ${{j.status}} | Total: ${{j.total}}</div>
+                                <div class="live-title">
+                                    <span>${{j.away_name}}</span>
+                                    <span class="live-score">${{j.away_score}} - ${{j.home_score}}</span>
+                                    <span>${{j.home_name}}</span>
+                                </div>
+                                <div class="live-status">⏱️ ${{j.status}}</div>
                                 <div class="live-data"><span class="live-label">Línea Viva:</span> <span class="live-value">${{j.linea_viva}}</span></div>
                                 <div class="live-data"><span class="live-label">Proy. Dinámica:</span> <span class="live-value">${{j.proyeccion_viva}}</span></div>
                                 <div class="live-data"><span class="live-label">Límite (+6):</span> <span class="live-value">${{j.limite}}</span></div>
