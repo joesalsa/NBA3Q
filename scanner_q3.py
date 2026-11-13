@@ -72,7 +72,6 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
 def check_results():
     try:
         con = get_db()
-        # MODIFICADO: Agregamos 'matchup' al SELECT para usarlo en el mensaje
         cursor = con.execute("SELECT id, event_id, linea_real, matchup FROM alertas_q3 WHERE status = 'PENDING'")
         pending = cursor.fetchall()
         con.close()
@@ -84,7 +83,6 @@ def check_results():
         games = r.json().get("events", [])
         
         for p in pending:
-            # MODIFICADO: Agregamos matchup al desempaquetado
             alert_id, event_id, linea, matchup = p[0], p[1], p[2], p[3]
             game = next((g for g in games if g.get("id") == event_id), None)
             if not game: continue
@@ -104,7 +102,6 @@ def check_results():
                 con.close()
                 print(f"✅ Resultado: {event_id} | {status} (Total: {final_total} vs Línea: {linea})")
                 
-                # NUEVO: Enviar mensaje de resultado a Telegram
                 emoji = "✅" if status == "WON" else "❌" if status == "LOST" else "⚖️"
                 msg_resultado = (
                     f"🏁 <b>RESULTADO DE ALERTA #{alert_id}</b>\n\n"
@@ -256,15 +253,15 @@ def scan_q3_q4():
         if t3_total == 0: continue
         
         proyeccion = t3_total * 1.25
-        limite_maximo = proyeccion + 6
-        limite_radar = limite_maximo + 5 # NUEVO: Límite para el aviso temprano
+        limite_maximo = proyeccion + 4
+        limite_radar = limite_maximo + 5
         
         event_key = f"{g['away_key']}_vs_{g['home_key']}"
         ln = infer_odds.get(event_key)
         if not ln: continue
         linea_actual = ln["line"]
         
-        # 1. ALERTA REAL (Entra en rango)
+        # 1. ALERTA REAL
         if linea_actual <= limite_maximo:
             msg = (
                 f"📡 <b>ALERTA DE VALOR — OVER (Q3/Q4)</b>\n\n"
@@ -272,7 +269,7 @@ def scan_q3_q4():
                 f"⏱️ <b>Estado:</b> P{g['period']} ({g['clock']})\n\n"
                 f"📊 <b>Puntos Q1-Q3:</b> {t3_total} pts\n"
                 f"📈 <b>Proyección Base:</b> {proyeccion:.1f} pts\n"
-                f"🎯 <b>Límite permitido (+6):</b> {limite_maximo:.1f}\n\n"
+                f"🎯 <b>Límite permitido (+4):</b> {limite_maximo:.1f}\n\n"
                 f"📌 <b>Línea en vivo:</b> {linea_actual:.1f}\n"
                 f"🪙 <b>Cuota Over:</b> @{ln['over']:.2f}\n\n"
                 f"💡 <b>Recomendación:</b> <b>⬆️ OVER {linea_actual:.1f}</b>"
@@ -282,7 +279,7 @@ def scan_q3_q4():
                 guardar_alerta_en_db(g["id"], g["matchup"], t3_total, proyeccion, limite_maximo, linea_actual, ln['over'])
                 print(f"✅ Alerta enviada y guardada para {g['matchup']}")
                 
-        # 2. RADAR (Está a punto de entrar, a 5 puntos o menos)
+        # 2. RADAR
         elif limite_maximo < linea_actual <= limite_radar:
             if g["id"] not in partidos_radar:
                 distancia = linea_actual - limite_maximo
@@ -292,7 +289,7 @@ def scan_q3_q4():
                     f"⏱️ <b>Estado:</b> P{g['period']} ({g['clock']})\n\n"
                     f"📊 <b>Puntos Q1-Q3:</b> {t3_total} pts\n"
                     f"📈 <b>Proyección Base:</b> {proyeccion:.1f} pts\n"
-                    f"🎯 <b>Límite de Apuesta (+6):</b> {limite_maximo:.1f}\n\n"
+                    f"🎯 <b>Límite de Apuesta (+4):</b> {limite_maximo:.1f}\n\n"
                     f"📌 <b>Línea en vivo:</b> {linea_actual:.1f}\n"
                     f"⚠️ <b>Distancia al objetivo:</b> Faltan {distancia:.1f} pts\n\n"
                     f"💡 <b>Prepárate:</b> La línea está cerca. Atento a tu app para el <b>OVER {limite_maximo:.1f}</b>."
@@ -363,7 +360,7 @@ def dashboard():
                     <th>Partido</th>
                     <th>Pts Q3</th>
                     <th>Proyección</th>
-                    <th>Límite (+6)</th>
+                    <th>Límite (+4)</th>
                     <th>Línea</th>
                     <th>Cuota</th>
                     <th>Total Final</th>
