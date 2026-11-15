@@ -208,7 +208,8 @@ def job_recolector():
         except ValueError: continue
         
         mins = (kickoff - ahora).total_seconds() / 60
-        if not (55 <= mins <= 65 or 25 <= mins <= 35): continue
+        # Guardar si el partido empieza en las próximas 2 horas (120 mins)
+        if not (0 < mins <= 120): continue
 
         home = ev.get("home_team", {}).get("name", "")
         away = ev.get("away_team", {}).get("name", "")
