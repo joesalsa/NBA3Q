@@ -389,7 +389,7 @@ def job_escaner():
             # --- REGLA 2 (HT) ---
             is_ht_exact = ("Halftime" in g["desc"]) or (g["period"] == 2 and (g["clock"] == "" or (secs is not None and secs <= 3.0)))
             if is_ht_exact and pre_row:
-                if 10 < margen < 16:
+                if margen < 26:
                     proy = ht_total * 2
                     _evaluar_y_alerta(con, g, 2, "HT", pregame, proy, pregame, vivo, ln)
                 else:
@@ -400,7 +400,7 @@ def job_escaner():
             is_start_q4 = (g["period"] == 4 and (secs is not None and secs >= 660))
             
             if (is_end_q3 or is_start_q4) and pre_row:
-                if 7 < margen < 21:
+                if margen < 26:
                     if t3_total > 0:
                         proy = t3_total * 1.25
                         _evaluar_y_alerta(con, g, 3, "EndQ3", pregame, proy, pregame, vivo, ln)
