@@ -48,25 +48,6 @@ def init_db():
         except: pass
         try: con.execute("ALTER TABLE alertas_q3 ADD COLUMN final_total INTEGER")
         except: pass
-
-        # === NUEVO: tabla de líneas de cierre del Q3 ===
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS lineas_cierre_q3 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT UNIQUE,
-                matchup TEXT,
-                q3_total INTEGER,
-                margen INTEGER,
-                proyeccion REAL,
-                limite_maximo REAL,
-                linea_cierre REAL,
-                cuota_over REAL,
-                cuota_under REAL,
-                timestamp TEXT
-            )
-        """)
-        # ================================================
-
         con.commit()
         con.close()
     except Exception as e:
@@ -84,24 +65,6 @@ def guardar_alerta_en_db(event_id, matchup, q3_points, proyeccion, limite, linea
         con.close()
     except Exception as e:
         print(f"[DB Error Guardar] {e}")
-
-# === NUEVO: guardar línea de cierre del Q3 ===
-def guardar_linea_cierre(event_id, matchup, q3_total, margen, proyeccion, limite_maximo, linea, over, under):
-    try:
-        con = get_db()
-        con.execute("""
-            INSERT OR IGNORE INTO lineas_cierre_q3
-            (event_id, matchup, q3_total, margen, proyeccion, limite_maximo, linea_cierre, cuota_over, cuota_under, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (event_id, matchup, q3_total, margen, proyeccion, limite_maximo, linea, over, under,
-              datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        con.commit()
-        con.close()
-        return True
-    except Exception as e:
-        print(f"[DB Error Cierre Q3] {e}")
-        return False
-# ================================================
 
 # ==========================================
 # LÓGICA DE RESULTADOS
@@ -259,9 +222,7 @@ def get_infer_odds():
                         balance = abs(over_p - 2.0) + abs(under_p - 2.0)
                         if balance < mejor_balance:
                             mejor_balance = balance
-                            # === NUEVO: incluir under ===
-                            mejor_odd = {"line": float(odd.get("line")), "over": over_p, "under": under_p}
-                            # ============================
+                            mejor_odd = {"line": float(odd.get("line")), "over": over_p}
                 if mejor_odd:
                     odds_dict[event_key] = mejor_odd
         return odds_dict
@@ -306,17 +267,7 @@ def scan_q3_q4():
         ln = infer_odds.get(event_key)
         if not ln: continue
         linea_actual = ln["line"]
-
-        # === NUEVO: guardar línea de cierre del Q3 (una sola vez por partido) ===
-        is_q3_final = "End of 3rd" in g["status"] or (g["period"] == 3 and g["clock"] in ["0.0", "0:00"])
-        if is_q3_final:
-            if guardar_linea_cierre(
-                g["id"], g["matchup"], t3_total, margen, proyeccion,
-                limite_maximo, linea_actual, ln["over"], ln.get("under", 0)
-            ):
-                print(f"📝 Línea de cierre Q3 guardada: {g['matchup']} → {linea_actual:.1f}")
-        # =========================================================================
-
+        
         # 1. ALERTA REAL
         if linea_actual <= limite_maximo:
             msg = (
@@ -453,24 +404,6 @@ def dashboard():
     except Exception as e:
         return f"<h1>Error cargando dashboard</h1><p>{e}</p>"
 
-# === NUEVO: endpoint para consultar líneas de cierre ===
-@app.get("/cierre_q3")
-def ver_cierre_q3():
-    try:
-        con = get_db()
-        cursor = con.execute("SELECT id, event_id, matchup, q3_total, margen, proyeccion, limite_maximo, linea_cierre, cuota_over, cuota_under, timestamp FROM lineas_cierre_q3 ORDER BY id DESC LIMIT 100")
-        rows = cursor.fetchall()
-        con.close()
-        return [{
-            "id": r[0], "event_id": r[1], "matchup": r[2], "q3_total": r[3],
-            "margen": r[4], "proyeccion": r[5], "limite_maximo": r[6],
-            "linea_cierre": r[7], "cuota_over": r[8], "cuota_under": r[9],
-            "timestamp": r[10]
-        } for r in rows]
-    except Exception as e:
-        return {"error": str(e)}
-# =========================================================
-
 # ==========================================
 # INICIO
 # ==========================================
@@ -490,4 +423,4 @@ def health_check():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    uvicorn.run("scanner_q3:app", host="0.0.0.0", port=port)
